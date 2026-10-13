@@ -1,0 +1,6 @@
+{
+  "name": "Lineage Updater & Downloader",
+  "description": "Discover LineageOS builds, browse historical archives, download ROM packages, verify SHA-256 digests, and manage updates.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

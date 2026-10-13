@@ -1,0 +1,801 @@
+package com.tahmidgaming.lineagearchive
+
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.ui.platform.testTag
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Archive
+import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.PhoneAndroid
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material.icons.filled.Storage
+import androidx.compose.material.icons.filled.SystemUpdate
+import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import android.os.Bundle
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent {
+            val context = LocalContext.current
+            var themeMode by remember { mutableStateOf(ThemePreferences.get(context)) }
+            ArchiveTheme(themeMode) {
+                ArchiveApp(themeMode, { mode ->
+                    themeMode = mode
+                    ThemePreferences.set(context, mode)
+                })
+            }
+        }
+    }
+}
+
+private enum class Screen { HOME, DEVICES, BUILDS, ARCHIVE, DOWNLOADS, TOOLS, GSI, UPDATES, SETTINGS, CHANGELOG, DIAGNOSTICS, SUPPORT, HARMONY_BUILD }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ArchiveApp(themeMode: ThemeMode, onThemeModeChange: (ThemeMode) -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val detected = remember { DeviceDetector.current() }
+    var screen by remember { mutableStateOf(Screen.HOME) }
+    BackHandler(enabled = screen != Screen.HOME) {
+        screen = when (screen) {
+            Screen.BUILDS, Screen.ARCHIVE -> Screen.DEVICES
+            Screen.GSI, Screen.HARMONY_BUILD -> Screen.TOOLS
+            Screen.CHANGELOG, Screen.DIAGNOSTICS, Screen.SUPPORT -> Screen.SETTINGS
+            else -> Screen.HOME
+        }
+    }
+    var devices by remember { mutableStateOf<List<LineageDevice>>(emptyList()) }
+    var selected by remember { mutableStateOf<LineageDevice?>(null) }
+    var builds by remember { mutableStateOf<List<LineageBuild>>(emptyList()) }
+    var archiveBuilds by remember { mutableStateOf<List<ArchiveBuildSummary>>(emptyList()) }
+    var downloads by remember { mutableStateOf(DownloadStore.items(context)) }
+    var query by remember { mutableStateOf("") }
+    var loading by remember { mutableStateOf(false) }
+    var initialChecking by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var flashCapability by remember { mutableStateOf(FlashManager.Capability(false, false, false)) }
+    var flashMessage by remember { mutableStateOf<String?>(null) }
+    var pendingFlash by remember { mutableStateOf<DownloadStore.Item?>(null) }
+    var gapps by remember { mutableStateOf<List<AddonDownload>>(emptyList()) }
+    var magisk by remember { mutableStateOf<List<AddonDownload>>(emptyList()) }
+    var gsis by remember { mutableStateOf<List<AddonDownload>>(emptyList()) }
+    var toolsLoading by remember { mutableStateOf(false) }
+    var toolsError by remember { mutableStateOf<String?>(null) }
+    var toolsRefresh by remember { mutableStateOf(0) }
+    var updateRefresh by remember { mutableStateOf(0) }
+    val currentOsVersion = remember { UpdateRepository.localOsVersion() }
+
+    var pendingDownload by remember { mutableStateOf<Triple<LineageFile, String, String?>?>(null) }
+    val storagePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val pending = pendingDownload
+        pendingDownload = null
+        if (granted && pending != null) {
+            val (file, device, version) = pending
+            DownloadHelper.enqueue(context, file, device, version)
+            screen = Screen.DOWNLOADS
+        }
+    }
+    val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    fun startDownload(file: LineageFile, device: String, version: String?) {
+        if (android.os.Build.VERSION.SDK_INT in 23..28 && context.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            pendingDownload = Triple(file, device, version)
+            storagePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        } else {
+            DownloadHelper.enqueue(context, file, device, version)
+            screen = Screen.DOWNLOADS
+        }
+    }
+
+    suspend fun refreshForDevice(device: LineageDevice?) {
+        if (device == null) return
+        runCatching { LineageRepository.builds(device.model) }
+            .onSuccess {
+                builds = it.sortedByDescending(LineageBuild::datetime)
+                if (LineageRepository.isUsingCachedFallback(LineageRepository.buildsCacheKey(device.model))) {
+                    error = "Offline mode: showing cached builds for " + device.name + ". Check Diagnostics for the last metadata cache time."
+                }
+            }
+            .onFailure { error = it.message ?: "Unable to check for builds" }
+    }
+
+    LaunchedEffect(Unit) {
+        val notificationPrefs = context.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+            !notificationPrefs.getBoolean("notification_permission_asked", false)) {
+            notificationPrefs.edit().putBoolean("notification_permission_asked", true).apply()
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        flashCapability = withContext(Dispatchers.IO) { FlashManager.detect(context) }
+        loading = true
+        error = null
+        runCatching { LineageRepository.devices() }
+            .onSuccess { list ->
+                devices = list
+                selected = DeviceDetector.match(detected, list)
+                if (LineageRepository.isUsingCachedFallback("devices")) {
+                    error = "Offline mode: showing cached device metadata. Check Diagnostics for the last cache update."
+                }
+                refreshForDevice(selected)
+            }
+            .onFailure { error = it.message ?: "Unable to connect to LineageOS" }
+        loading = false
+        initialChecking = false
+    }
+
+    LaunchedEffect(screen, toolsRefresh) {
+        if (screen == Screen.TOOLS || screen == Screen.GSI) {
+            toolsLoading = true
+            toolsError = null
+            runCatching {
+                if (screen == Screen.TOOLS) {
+                    gapps = AddonRepository.gapps()
+                    magisk = AddonRepository.magisk()
+                }
+                gsis = AddonRepository.gsi()
+            }.onFailure { toolsError = it.message ?: "Unable to load addon downloads" }
+            toolsLoading = false
+        }
+        while (screen == Screen.DOWNLOADS) {
+            downloads = DownloadStore.items(context)
+            delay(350)
+        }
+    }
+
+    fun loadDevices() = scope.launch {
+        loading = true
+        error = null
+        runCatching { LineageRepository.devices() }
+            .onSuccess {
+                devices = it
+                screen = Screen.DEVICES
+                if (LineageRepository.isUsingCachedFallback("devices")) {
+                    error = "Offline mode: showing cached device metadata. Check Diagnostics for the last cache update."
+                }
+            }
+            .onFailure { error = it.message ?: "Unable to load devices" }
+        loading = false
+    }
+
+    fun selectDevice(device: LineageDevice) {
+        selected = device
+        screen = Screen.BUILDS
+        scope.launch {
+            loading = true
+            error = null
+            refreshForDevice(device)
+            loading = false
+        }
+    }
+
+    fun loadArchive() {
+        val device = selected ?: return
+        screen = Screen.ARCHIVE
+        scope.launch {
+            loading = true
+            error = null
+            runCatching { LineageRepository.archiveBuilds(device.model) }
+                .onSuccess {
+                    archiveBuilds = it.sortedByDescending { item -> item.id }
+                    if (LineageRepository.isUsingCachedFallback("archive_summaries")) {
+                        error = "Offline mode: showing cached archive metadata. Check Diagnostics for the last cache update."
+                    }
+                }
+                .onFailure { error = it.message ?: "Unable to load archive" }
+            loading = false
+        }
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        GlassBackground()
+        Scaffold(
+            containerColor = Color.Transparent,
+            topBar = {
+                if (screen != Screen.HOME && screen != Screen.DOWNLOADS) {
+                    TopAppBar(
+                        title = { Text(titleFor(screen), fontWeight = FontWeight.SemiBold) },
+                        navigationIcon = { IconButton(onClick = { screen = Screen.HOME }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
+                        colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)
+                    )
+                }
+            },
+            bottomBar = {
+                if (screen != Screen.DOWNLOADS) FloatingNavigationBar(screen) { target ->
+                    when (target) {
+                        Screen.ARCHIVE -> if (selected != null) loadArchive() else loadDevices()
+                        else -> screen = target
+                    }
+                }
+            }
+        ) { padding ->
+            Column(Modifier.fillMaxSize().padding(padding).padding(horizontal = 18.dp)) {
+                when (screen) {
+                    Screen.HOME -> if (initialChecking) CheckingContent() else HomeContent(
+                        detected, selected, builds.firstOrNull()?.files?.firstOrNull(), builds.firstOrNull(), loading, error, flashCapability, downloads,
+                        onRefresh = { scope.launch { loading = true; error = null; refreshForDevice(selected); loading = false } },
+                        onChoose = ::loadDevices,
+                        onDownloads = { screen = Screen.DOWNLOADS },
+                        onArchive = ::loadArchive,
+                        onDownload = { file, version -> startDownload(file, selected?.model ?: "device", version) },
+                        onFlash = { pendingFlash = it },
+                        onTools = { screen = Screen.TOOLS }
+                    )
+                    Screen.DEVICES -> DeviceContent(devices, query, { query = it }, loading, error, ::selectDevice)
+                    Screen.BUILDS -> BuildContent(selected, builds, loading, error, flashCapability, downloads, { pendingFlash = it }) { file, version -> startDownload(file, selected?.model ?: "device", version) }
+                    Screen.ARCHIVE -> ArchiveContent(selected, archiveBuilds, loading, error) { summary ->
+                        scope.launch {
+                            loading = true
+                            error = null
+                            runCatching { LineageRepository.archiveBuild(summary.id) }
+                                .onSuccess { detail ->
+                                    if (detail.url != null) startDownload(LineageFile(detail.filename, detail.filesize, detail.sha256, detail.url), selected?.model ?: summary.device, archiveVersion(detail.filename))
+                                    else error = "This archived build is not currently stored online."
+                                }
+                                .onFailure { error = it.message ?: "Unable to open archived build" }
+                            loading = false
+                        }
+                    }
+                    Screen.DOWNLOADS -> DownloadsScreen(context, downloads, flashCapability, flashMessage, { flashMessage = null }, { item ->
+                        val result = FlashManager.flashVerifiedZip(context, item.filename, FlashManager.Recovery.TWRP)
+                        flashMessage = if (result.isSuccess) result.getOrNull() else result.exceptionOrNull()?.message ?: "Unable to start TWRP installation."
+                    }, { item ->
+                        val result = AppUpdateInstaller.install(context, item)
+                        flashMessage = if (result.isSuccess) null else result.exceptionOrNull()?.message ?: "Unable to verify or install this APK."
+                    }, { screen = Screen.HOME }, { screen = Screen.SETTINGS })
+                    Screen.UPDATES -> UpdateCenterScreen(context, selected, currentOsVersion, { file, device, version -> startDownload(file, device ?: "updates", version) }, updateRefresh) { updateRefresh++ }
+                    Screen.TOOLS -> ToolsScreen(
+                        context = context,
+                        capability = flashCapability,
+                        downloads = downloads,
+                        gapps = gapps,
+                        magisk = magisk,
+                        gsis = gsis,
+                        loading = toolsLoading,
+                        error = toolsError,
+                        onRefresh = { toolsRefresh++ },
+                        onCapabilityChange = { flashCapability = it },
+                        onOpenGsi = { screen = Screen.GSI },
+                        onOpenHarmonyBuild = { screen = Screen.HARMONY_BUILD },
+                        onDownloadAddon = { addon ->
+                            startDownload(LineageFile(addon.name, addon.size, addon.sha256, addon.url), "addons", addon.version)
+                        }
+                    )
+                    Screen.GSI -> GsiDiscoveryScreen(gsis, toolsLoading, toolsError, { toolsRefresh++ }) { addon ->
+                        startDownload(LineageFile(addon.name, addon.size, addon.sha256, addon.url), "gsi", addon.version)
+                    }
+                    Screen.SETTINGS -> SettingsContent(context, themeMode, onThemeModeChange, flashCapability, { flashCapability = it }, { screen = Screen.CHANGELOG }, { screen = Screen.DIAGNOSTICS }, { screen = Screen.SUPPORT })
+                    Screen.CHANGELOG -> ChangelogContent()
+                    Screen.DIAGNOSTICS -> DiagnosticsContent(context, detected, selected, flashCapability, downloads)
+                    Screen.SUPPORT -> SupportContent()
+                    Screen.HARMONY_BUILD -> HarmonyRecoveryBuildScreen(context)
+                }
+            }
+        }
+    }
+
+    pendingFlash?.let { item ->
+        AlertDialog(
+            onDismissRequest = { pendingFlash = null },
+            title = { Text("Flash with TWRP?") },
+            text = { Text("The verified ROM ZIP will be handed to TWRP and the device will reboot into recovery. Make sure this package is intended for ${item.device} and that you have a current backup.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingFlash = null
+                    scope.launch(Dispatchers.IO) {
+                        val result = FlashManager.flashVerifiedZip(context, item.filename, FlashManager.Recovery.TWRP)
+                        flashMessage = if (result.isSuccess) null else result.exceptionOrNull()?.message ?: "Unable to prepare TWRP installation."
+                    }
+                }) { Text("Flash") }
+            },
+            dismissButton = { TextButton(onClick = { pendingFlash = null }) { Text("Cancel") } }
+        )
+    }
+}
+
+@Composable
+private fun GlassBackground() {
+    val dark = LocalArchiveDarkTheme.current
+    Box(Modifier.fillMaxSize().background(Brush.radialGradient(if (dark) listOf(Color(0xFF18304A), Color(0xFF0C1017), Color(0xFF07090D)) else listOf(Color(0xFFE9F4FF), Color(0xFFF5F7FB), Color(0xFFEDEFF4)))))
+}
+
+@Composable
+private fun FloatingNavigationBar(screen: Screen, onSelect: (Screen) -> Unit) {
+    val dark = LocalArchiveDarkTheme.current
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .navigationBarsPadding()
+            .padding(horizontal = 18.dp, vertical = 6.dp),
+        shape = RoundedCornerShape(30.dp),
+        color = if (dark) Color(0xCC171B22) else Color(0xD9FFFFFF),
+        tonalElevation = 0.dp,
+        shadowElevation = 14.dp,
+        border = BorderStroke(1.dp, if (dark) Color.White.copy(.10f) else Color.White.copy(.85f))
+    ) {
+        NavigationBar(Modifier.height(72.dp), containerColor = Color.Transparent, tonalElevation = 0.dp) {
+            NavItem("Home", Icons.Default.Home, screen == Screen.HOME) { onSelect(Screen.HOME) }
+            NavItem("Archive", Icons.Default.Archive, screen == Screen.ARCHIVE) { onSelect(Screen.ARCHIVE) }
+            NavItem("Downloads", Icons.Default.Download, screen == Screen.DOWNLOADS) { onSelect(Screen.DOWNLOADS) }
+            NavItem("Updates", Icons.Default.SystemUpdate, screen == Screen.UPDATES) { onSelect(Screen.UPDATES) }
+            NavItem("Settings", Icons.Default.Settings, screen == Screen.SETTINGS) { onSelect(Screen.SETTINGS) }
+        }
+    }
+}
+
+@Composable
+private fun RowScope.NavItem(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, selected: Boolean, onClick: () -> Unit) {
+    NavigationBarItem(
+        selected = selected,
+        onClick = onClick,
+        modifier = Modifier.testTag("nav_${label.lowercase()}"),
+        icon = { Icon(icon, contentDescription = label) },
+        label = { Text(label, maxLines = 1) },
+        colors = NavigationBarItemDefaults.colors(
+            indicatorColor = MaterialTheme.colorScheme.primary.copy(.15f),
+            selectedIconColor = MaterialTheme.colorScheme.primary,
+            selectedTextColor = MaterialTheme.colorScheme.primary,
+            unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+            unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    )
+}
+
+private fun titleFor(screen: Screen) = when (screen) {
+    Screen.DEVICES -> "Choose device"
+    Screen.BUILDS -> "Available builds"
+    Screen.ARCHIVE -> "Archive"
+    Screen.DOWNLOADS -> "Software update"
+    Screen.TOOLS -> "Flashing & tools"
+    Screen.GSI -> "GSI Discovery"
+    Screen.UPDATES -> "Updates"
+    Screen.SETTINGS -> "Settings"
+    Screen.CHANGELOG -> "Changelog"
+    Screen.DIAGNOSTICS -> "Diagnostics"
+    Screen.SUPPORT -> "Support Development"
+    Screen.HARMONY_BUILD -> "Harmony Recovery Build Lab"
+    Screen.HOME -> "Lineage Updater & Downloader"
+}
+
+@Composable
+private fun CheckingContent() {
+    Column(Modifier.fillMaxSize().padding(bottom = 36.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+        Text("Software update", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(28.dp)); UpdateProgressRing(null, "LineageOS", "Updater"); Spacer(Modifier.height(28.dp))
+        Text("Checking…", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(6.dp)); Text("Checking for available builds", color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+@Composable
+private fun HomeContent(detected: DeviceDetector.Info, selected: LineageDevice?, latest: LineageFile?, latestBuild: LineageBuild?, loading: Boolean, error: String?, flashCapability: FlashManager.Capability, downloads: List<DownloadStore.Item>, onRefresh: () -> Unit, onChoose: () -> Unit, onDownloads: () -> Unit, onArchive: () -> Unit, onDownload: (LineageFile, String?) -> Unit, onFlash: (DownloadStore.Item) -> Unit, onTools: () -> Unit) {
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(14.dp), contentPadding = PaddingValues(top = 14.dp, bottom = 24.dp)) {
+        item { Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Software Update", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold); Text("LineageOS Archive Downloader", color = MaterialTheme.colorScheme.onSurfaceVariant) }; IconButton(onClick = onRefresh) { Icon(Icons.Default.Refresh, "Check again") } } }
+        item { GlassCard { Row(verticalAlignment = Alignment.CenterVertically) { IconBubble(Icons.Default.PhoneAndroid); Spacer(Modifier.width(14.dp)); Column(Modifier.weight(1f)) { Text("This device", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant); Text("${detected.manufacturer} ${detected.model}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold); Text("${detected.device} • ${detected.product}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) } }; Spacer(Modifier.height(12.dp)); StatusPill(if (selected != null) "Supported • ${selected.name}" else "Select a supported device", if (selected != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant) } }
+        item { GlassCard { Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Latest build", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold); if (latestBuild != null && latest != null) { Spacer(Modifier.height(4.dp)); Text("LineageOS ${latestBuild.version ?: ""}".trim(), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Text(formatDate(latestBuild.datetime), color = MaterialTheme.colorScheme.onSurfaceVariant) } else if (!loading) Text("No current build found", color = MaterialTheme.colorScheme.onSurfaceVariant) }; if (latest != null && latestBuild != null) FilledIconButton(onClick = { onDownload(latest, latestBuild.version) }) { Icon(Icons.Default.Download, "Download latest build") } }; if (loading) { Spacer(Modifier.height(16.dp)); LinearProgressIndicator(Modifier.fillMaxWidth()) } else if (latest != null) { Spacer(Modifier.height(14.dp)); BuildMetaRow("Package", latest.filename); BuildMetaRow("Size", formatBytes(latest.size)); BuildMetaRow("Security patch", latest.os_patch_level ?: "Not supplied"); latest.sha256?.let { BuildMetaRow("SHA-256", it.take(16) + "…") }
+                    downloads.firstOrNull { it.filename == latest.filename && it.status.startsWith("Downloaded") && it.verified == true }?.let {
+                        if (flashCapability.ready) {
+                            Spacer(Modifier.height(10.dp))
+                            OutlinedButton(onClick = { onFlash(it) }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
+                                Icon(Icons.Default.Build, null); Spacer(Modifier.width(7.dp)); Text("Flash with TWRP")
+                            }
+                        }
+                    } } } }
+        error?.let { item { ErrorCard(it, onRefresh) } }
+        item { Button(onClick = onChoose, modifier = Modifier.fillMaxWidth().height(54.dp), shape = RoundedCornerShape(20.dp)) { Icon(Icons.Default.Search, null); Spacer(Modifier.width(8.dp)); Text("Choose device", fontWeight = FontWeight.SemiBold) } }
+        item { Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) { OutlinedButton(onClick = onArchive, enabled = selected != null, modifier = Modifier.weight(1f).height(52.dp), shape = RoundedCornerShape(18.dp)) { Icon(Icons.Default.Archive, null); Spacer(Modifier.width(6.dp)); Text("Archive") }; OutlinedButton(onClick = onDownloads, modifier = Modifier.weight(1f).height(52.dp), shape = RoundedCornerShape(18.dp)) { Icon(Icons.Default.Download, null); Spacer(Modifier.width(6.dp)); Text("Downloads") } } }
+        item { OutlinedButton(onClick = onTools, modifier = Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(18.dp)) { Icon(Icons.Default.Build, null); Spacer(Modifier.width(7.dp)); Text("Flashing & tools") } }
+    }
+}
+
+@Composable
+private fun DeviceContent(devices: List<LineageDevice>, query: String, onQuery: (String) -> Unit, loading: Boolean, error: String?, onSelect: (LineageDevice) -> Unit) {
+    Column(Modifier.fillMaxSize()) {
+        Spacer(Modifier.height(6.dp)); OutlinedTextField(value = query, onValueChange = onQuery, modifier = Modifier.fillMaxWidth(), placeholder = { Text("Manufacturer, model or codename") }, leadingIcon = { Icon(Icons.Default.Search, null) }, singleLine = true, shape = RoundedCornerShape(20.dp)); Spacer(Modifier.height(10.dp))
+        error?.let { Text(it, color = MaterialTheme.colorScheme.error) }; if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(vertical = 10.dp)) { items(devices.filter { query.isBlank() || it.name.contains(query, true) || it.model.contains(query, true) || it.oem.contains(query, true) }) { device ->
+            GlassCard(onClick = { onSelect(device) }) { Row(verticalAlignment = Alignment.CenterVertically) { IconBubble(Icons.Default.PhoneAndroid); Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) { Text(device.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold); Text("${device.oem} • ${device.model}", color = MaterialTheme.colorScheme.onSurfaceVariant) }; Icon(Icons.Default.SystemUpdate, null, tint = MaterialTheme.colorScheme.primary) } }
+        } }
+    }
+}
+
+@Composable
+private fun BuildContent(selected: LineageDevice?, builds: List<LineageBuild>, loading: Boolean, error: String?, flashCapability: FlashManager.Capability, downloads: List<DownloadStore.Item>, onFlash: (DownloadStore.Item) -> Unit, onDownload: (LineageFile, String?) -> Unit) {
+    Column(Modifier.fillMaxSize()) {
+        selected?.let { Text(it.name, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Text("Official LineageOS builds", color = MaterialTheme.colorScheme.onSurfaceVariant); Spacer(Modifier.height(12.dp)) }
+        if (loading) LinearProgressIndicator(Modifier.fillMaxWidth()); error?.let { ErrorCard(it) }
+        if (!loading && builds.isEmpty() && error == null) EmptyState(Icons.Default.SystemUpdate, "No builds found", "The official updater returned no builds for this device.")
+        else LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 20.dp)) { items(builds) { build -> build.files.firstOrNull()?.let { file ->
+            GlassCard { Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("LineageOS ${build.version ?: ""}".trim(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold); Text(formatDate(build.datetime), color = MaterialTheme.colorScheme.onSurfaceVariant) }; FilledIconButton(onClick = { onDownload(file, build.version) }) { Icon(Icons.Default.Download, "Download") } }; Spacer(Modifier.height(10.dp)); BuildMetaRow("Package", file.filename); BuildMetaRow("Size", formatBytes(file.size)); BuildMetaRow("Patch", file.os_patch_level ?: "Not supplied"); file.sha256?.let { BuildMetaRow("SHA-256", it.take(20) + "…") }
+            downloads.firstOrNull { it.filename == file.filename && it.status.startsWith("Downloaded") && it.verified == true }?.let {
+                if (flashCapability.ready) {
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedButton(onClick = { onFlash(it) }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
+                        Icon(Icons.Default.Build, null); Spacer(Modifier.width(7.dp)); Text("Flash with TWRP")
+                    }
+                }
+            } }
+        } } }
+    }
+}
+
+@Composable
+private fun ArchiveContent(selected: LineageDevice?, archives: List<ArchiveBuildSummary>, loading: Boolean, error: String?, onDownload: (ArchiveBuildSummary) -> Unit) {
+    Column(Modifier.fillMaxSize()) {
+        GlassCard { Row(verticalAlignment = Alignment.CenterVertically) { IconBubble(Icons.Default.Archive); Spacer(Modifier.width(12.dp)); Column { Text("Unofficial archive", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold); Text("Historical builds • ${selected?.name ?: "device"}", color = MaterialTheme.colorScheme.onSurfaceVariant) } } }
+        Spacer(Modifier.height(12.dp)); if (loading) LinearProgressIndicator(Modifier.fillMaxWidth()); error?.let { ErrorCard(it) }
+        if (!loading && archives.isEmpty() && error == null) EmptyState(Icons.Default.Archive, "No archived builds", "No historical packages were returned for this device.")
+        else LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 20.dp)) { items(archives) { item -> GlassCard { Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text(item.filename, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis); Text(item.device, color = MaterialTheme.colorScheme.onSurfaceVariant) }; FilledIconButton(onClick = { onDownload(item) }) { Icon(Icons.Default.Download, "Download archived build") } } } } }
+    }
+}
+
+@Composable
+private fun DownloadsScreen(
+    context: android.content.Context,
+    downloads: List<DownloadStore.Item>,
+    flashCapability: FlashManager.Capability,
+    flashMessage: String?,
+    onDismissFlashMessage: () -> Unit,
+    onFlash: (DownloadStore.Item) -> Unit,
+    onInstall: (DownloadStore.Item) -> Unit,
+    onBack: () -> Unit,
+    onSettings: () -> Unit
+) {
+    val active = downloads.lastOrNull {
+        it.status.startsWith("Downloading") ||
+            it.status == "Queued" ||
+            it.status == "Paused"
+    }
+
+    Column(Modifier.fillMaxSize()) {
+        Row(
+            Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
+            }
+            Text(
+                "Software update",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f)
+            )
+            IconButton(onClick = onSettings) {
+                Icon(Icons.Default.Settings, "Settings")
+            }
+        }
+
+        if (active != null) {
+            val percent = downloadPercent(active.status)
+            val animated = animateFloatAsState(
+                (percent ?: 0) / 100f,
+                tween(450),
+                label = "download-progress"
+            )
+
+            Column(
+                Modifier.fillMaxSize().padding(bottom = 18.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Spacer(Modifier.height(24.dp))
+                UpdateProgressRing(
+                    animated.value,
+                    "LineageOS",
+                    active.version ?: "Archive"
+                )
+                Spacer(Modifier.height(24.dp))
+                Text(
+                    when (active.status) {
+                        "Paused" -> "Paused"
+                        "Queued" -> "Preparing…"
+                        else -> "Downloading…"
+                    },
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    percent?.let { "$it%" } ?: "Preparing",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    active.filename,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    active.device,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(22.dp))
+
+                if (active.status == "Paused") {
+                    Button(
+                        onClick = { DownloadHelper.resume(context, active) },
+                        shape = RoundedCornerShape(18.dp)
+                    ) {
+                        Icon(Icons.Default.Download, null)
+                        Spacer(Modifier.width(7.dp))
+                        Text("Resume")
+                    }
+                } else {
+                    OutlinedButton(
+                        onClick = { DownloadHelper.pause(context, active.id) },
+                        shape = RoundedCornerShape(18.dp)
+                    ) {
+                        Text("Pause")
+                    }
+                }
+            }
+        } else {
+            Text(
+                "Downloads",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(Modifier.height(10.dp))
+
+            if (flashCapability.ready) {
+                GlassCard {
+                    SettingRow(
+                        Icons.Default.Build,
+                        "TWRP flashing available",
+                        "Root and TWRP were detected. Verified downloaded ZIPs can be handed to TWRP."
+                    )
+                }
+                Spacer(Modifier.height(10.dp))
+            }
+
+            if (flashMessage != null) {
+                ErrorCard(flashMessage, onDismissFlashMessage)
+                Spacer(Modifier.height(10.dp))
+            }
+
+            if (downloads.isEmpty()) {
+                EmptyState(
+                    Icons.Default.Download,
+                    "No downloads yet",
+                    "Downloaded builds will appear here."
+                )
+            } else {
+                LazyColumn(
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    contentPadding = PaddingValues(bottom = 20.dp)
+                ) {
+                    items(downloads.asReversed()) {
+                        DownloadHistoryCard(it, flashCapability, onFlash, onInstall)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun UpdateProgressRing(progress: Float?, centerTitle: String, centerSubtitle: String) {
+    Box(contentAlignment = Alignment.Center, modifier = Modifier.size(286.dp)) {
+        Surface(Modifier.size(286.dp), CircleShape, color = MaterialTheme.colorScheme.surface.copy(.42f), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(.65f)), shadowElevation = 16.dp) {}
+        if (progress == null) CircularProgressIndicator(Modifier.size(238.dp), strokeWidth = 9.dp, trackColor = MaterialTheme.colorScheme.surfaceVariant.copy(.65f))
+        else CircularProgressIndicator(progress = { progress.coerceIn(0f, 1f) }, modifier = Modifier.size(238.dp), strokeWidth = 9.dp, trackColor = MaterialTheme.colorScheme.surfaceVariant.copy(.7f))
+        Column(horizontalAlignment = Alignment.CenterHorizontally) { Icon(Icons.Default.SystemUpdate, null, Modifier.size(38.dp), tint = MaterialTheme.colorScheme.primary); Spacer(Modifier.height(8.dp)); Text(centerTitle, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold); Text(centerSubtitle, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+    }
+}
+
+@Composable
+private fun DownloadHistoryCard(item: DownloadStore.Item, flashCapability: FlashManager.Capability, onFlash: (DownloadStore.Item) -> Unit, onInstall: (DownloadStore.Item) -> Unit) {
+    GlassCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconBubble(if (item.verified == true) Icons.Default.CheckCircle else Icons.Default.Download)
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(item.filename, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                Text(item.device, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(item.status, color = if (item.verified == false) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        if (item.verified == true && item.status.startsWith("Downloaded") && item.filename.endsWith(".apk", true)) {
+            Spacer(Modifier.height(12.dp))
+            OutlinedButton(onClick = { onInstall(item) }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
+                Icon(Icons.Default.SystemUpdate, null)
+                Spacer(Modifier.width(7.dp))
+                Text("Verify & install app update")
+            }
+            Spacer(Modifier.height(5.dp))
+            Text("Checks the source SHA-256, package ID, and signing certificate before opening Android's installer.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+        }
+        if (flashCapability.ready && item.status.startsWith("Downloaded") && item.filename.endsWith(".zip", true)) {
+            Spacer(Modifier.height(12.dp))
+            OutlinedButton(onClick = { onFlash(item) }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
+                Icon(Icons.Default.Build, null)
+                Spacer(Modifier.width(7.dp))
+                Text("Flash with TWRP")
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsContent(
+    context: android.content.Context,
+    themeMode: ThemeMode,
+    onThemeModeChange: (ThemeMode) -> Unit,
+    capability: FlashManager.Capability,
+    onCapabilityChange: (FlashManager.Capability) -> Unit,
+    onChangelog: () -> Unit,
+    onDiagnostics: () -> Unit,
+    onSupport: () -> Unit
+) {
+    val uriHandler = LocalUriHandler.current
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(14.dp), contentPadding = PaddingValues(top = 10.dp, bottom = 30.dp)) {
+        item { Text("Settings", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold); Text("One UI-inspired controls with Liquid Glass surfaces", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        item { GlassCard { SettingRow(Icons.Default.Settings, "Appearance", "Choose how the downloader looks"); Spacer(Modifier.height(14.dp)); Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) { ThemeChoice("System", ThemeMode.SYSTEM, themeMode, onThemeModeChange, Modifier.weight(1f)); ThemeChoice("Light", ThemeMode.LIGHT, themeMode, onThemeModeChange, Modifier.weight(1f)); ThemeChoice("Dark", ThemeMode.DARK, themeMode, onThemeModeChange, Modifier.weight(1f)) } } }
+        item {
+            GlassCard {
+                SettingRow(Icons.Default.Build, "Virtual Phone Root Simulator", "Test root, recovery handoff, and dd flashing in the browser emulator safely.");
+                Spacer(Modifier.height(12.dp));
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                        Text("Root Testing Mode", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            if (capability.isSimulation) "Active: TWRP, OrangeFox, and dd flasher controls are unlocked"
+                            else "Disabled: physical root checking active",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = capability.isSimulation,
+                        onCheckedChange = { enabled ->
+                            FlashManager.setRootTestingMode(context, enabled)
+                            onCapabilityChange(FlashManager.detect(context))
+                        }
+                    )
+                }
+            }
+        }
+        item { GlassCard { SettingRow(Icons.Default.Shield, "Verification", "Downloads are checked with SHA-256 when the source provides a checksum."); Spacer(Modifier.height(16.dp)); SettingRow(Icons.Default.Info, "Safety", "Downloaded packages are verified with SHA-256 when a checksum is supplied. If root and TWRP are detected, a verified ZIP can be handed to TWRP for installation.") } }
+        item { GlassCard { SettingRow(Icons.Default.Wifi, "Sources", "Official LineageOS builds and the clearly labeled TimSchumi archive."); Spacer(Modifier.height(16.dp)); SettingRow(Icons.Default.Storage, "Compatibility", "Android 6.0+ (API 23) with resumable downloads where the server supports HTTP Range requests."); Spacer(Modifier.height(16.dp)); Text("Version ${BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant) } }
+        item { GlassCard { SettingRow(Icons.Default.Info, "Support development", "Report bugs, suggest supported devices, contribute code, and review verified funding options."); Spacer(Modifier.height(10.dp)); OutlinedButton(onClick = onSupport, modifier = Modifier.fillMaxWidth()) { Text("Open Support Development") }; TextButton(onClick = onChangelog, modifier = Modifier.fillMaxWidth()) { Text("Read the in-app changelog") }; TextButton(onClick = onDiagnostics, modifier = Modifier.fillMaxWidth()) { Text("Open diagnostics") }; TextButton(onClick = { uriHandler.openUri("https://github.com/tahmidgaming700/lineageos-archive-downloader") }, modifier = Modifier.fillMaxWidth()) { Text("Open project on GitHub") } } }
+    }
+}
+
+@Composable
+private fun ChangelogContent() {
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(top = 10.dp, bottom = 28.dp)) {
+        item { GlassCard { Text("Version 2.0.0", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Spacer(Modifier.height(4.dp)); Text("Development build — not yet a production release", color = MaterialTheme.colorScheme.error) } }
+        item { GlassCard { SettingRow(Icons.Default.SystemUpdate, "LineageOS tracking", "Live official device/build discovery plus a separately labelled historical archive."); Spacer(Modifier.height(12.dp)); SettingRow(Icons.Default.Download, "Downloads & integrity", "Background downloads, resume support, SHA-256 verification when a source digest is available, and explicit failure status.") } }
+        item { GlassCard { SettingRow(Icons.Default.Search, "GSI discovery", "Community GSI release assets with architecture filters and source links. Compatibility still needs device-specific checking."); Spacer(Modifier.height(12.dp)); SettingRow(Icons.Default.Build, "DD Flasher", "Root-only raw image writing to selected by-name partitions, including boot and system variants, with a destructive-action confirmation."); Spacer(Modifier.height(12.dp)); SettingRow(Icons.Default.Storage, "Harmony Recovery", "Build-script planning for a Linux host and configurable recovery release tracking. The phone does not fabricate recovery images.") } }
+        item { GlassCard { SettingRow(Icons.Default.Shield, "Secure app update", "Requires a trusted SHA-256, matching package ID, matching signer, and a newer version before opening Android's installer."); Spacer(Modifier.height(12.dp)); SettingRow(Icons.Default.Info, "Diagnostics & support", "Copy a privacy-conscious device/app report, open the issue tracker, and review the release safeguards.") } }
+        item { GlassCard { Text("Release status", fontWeight = FontWeight.Bold); Spacer(Modifier.height(5.dp)); Text("The development build and tests must pass CI. A public release additionally requires a production signing keystore and a certificate fingerprint confirmed against the installed app. No production APK is published by this changelog screen.") } }
+    }
+}
+
+@Composable
+private fun DiagnosticsContent(
+    context: android.content.Context,
+    detected: DeviceDetector.Info,
+    selected: LineageDevice?,
+    capability: FlashManager.Capability,
+    downloads: List<DownloadStore.Item>
+) {
+    val report = listOf(
+        "App version: " + BuildConfig.VERSION_NAME + " (" + BuildConfig.VERSION_CODE + ")",
+        "Package ID: " + context.packageName,
+        "Android: " + android.os.Build.VERSION.RELEASE + " / API " + android.os.Build.VERSION.SDK_INT,
+        "Device: " + detected.manufacturer + " " + detected.model,
+        "Device codename: " + detected.device,
+        "Product: " + detected.product,
+        "Selected LineageOS device: " + (selected?.name ?: "not selected"),
+        "Selected codename: " + (selected?.model ?: "not selected"),
+        "Root access detected: " + capability.rooted,
+        "Root simulation (Virtual Phone): " + capability.isSimulation,
+        "TWRP detected: " + capability.twrpDetected,
+        "OrangeFox detected: " + capability.orangeFoxDetected,
+        "Tracked downloads: " + downloads.size,
+        "Active downloads: " + downloads.count { it.status == "Queued" || it.status == "Paused" || it.status.startsWith("Downloading") },
+        "Failed downloads: " + downloads.count { it.status.startsWith("Failed") || it.status.contains("FAILED") },
+        "Last public metadata cache update: " + (LineageRepository.lastCacheUpdated()?.let { SimpleDateFormat("dd MMM yyyy, HH:mm", Locale.US).format(Date(it)) } ?: "never")
+    ).joinToString("\n")
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(top = 10.dp, bottom = 28.dp)) {
+        item { GlassCard { Text("Diagnostics", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Spacer(Modifier.height(5.dp)); Text("This report intentionally excludes IMEI, serial number, account details, and file contents. Review it before sharing.", color = MaterialTheme.colorScheme.onSurfaceVariant) } }
+        item { GlassCard { Text(report, style = MaterialTheme.typography.bodyMedium); Spacer(Modifier.height(12.dp)); Button(onClick = { val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager; clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Lineage Updater diagnostics", report)); android.widget.Toast.makeText(context, "Diagnostics copied", android.widget.Toast.LENGTH_SHORT).show() }, modifier = Modifier.fillMaxWidth()) { Text("Copy diagnostic summary") } } }
+    }
+}
+
+@Composable
+private fun SupportContent() {
+    val uriHandler = LocalUriHandler.current
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(top = 10.dp, bottom = 28.dp)) {
+        item { GlassCard { Text("Support Development", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Spacer(Modifier.height(6.dp)); Text("Help improve device coverage, report reproducible bugs, contribute code, and review release safeguards. Do not share private keys, serial numbers, or account tokens in public issues.") } }
+        item { GlassCard { SettingRow(Icons.Default.Info, "Report a bug", "Include Android version, app version, source URL, and a redacted diagnostic summary."); Spacer(Modifier.height(10.dp)); OutlinedButton(onClick = { uriHandler.openUri("https://github.com/tahmidgaming700/lineageos-archive-downloader/issues") }, modifier = Modifier.fillMaxWidth()) { Text("Open issue tracker") }; TextButton(onClick = { uriHandler.openUri("https://github.com/tahmidgaming700/lineageos-archive-downloader/pulls") }, modifier = Modifier.fillMaxWidth()) { Text("Contribute with a pull request") } } }
+        item { GlassCard { SettingRow(Icons.Default.Shield, "Funding", "No verified sponsor or donation destination is configured in this repository. This build intentionally shows no payment link; a real destination must be added and verified by the project owner first.") } }
+    }
+}
+
+@Composable
+private fun ThemeChoice(label: String, mode: ThemeMode, selected: ThemeMode, onClick: (ThemeMode) -> Unit, modifier: Modifier) {
+    val chosen = mode == selected
+    val shape = RoundedCornerShape(16.dp)
+    Box(modifier = modifier.clickable { onClick(mode) }.background(if (chosen) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface.copy(.55f), shape).border(1.dp, if (chosen) MaterialTheme.colorScheme.primary.copy(.25f) else MaterialTheme.colorScheme.outlineVariant.copy(.45f), shape), contentAlignment = Alignment.Center) { Text(label, modifier = Modifier.padding(vertical = 12.dp), fontWeight = if (chosen) FontWeight.SemiBold else FontWeight.Normal) }
+}
+
+@Composable
+private fun GlassCard(onClick: (() -> Unit)? = null, content: @Composable ColumnScope.() -> Unit) {
+    val dark = LocalArchiveDarkTheme.current
+    val shape = RoundedCornerShape(26.dp)
+    val modifier = if (onClick != null) Modifier.fillMaxWidth().clickable(onClick = onClick) else Modifier.fillMaxWidth()
+    Box(modifier = modifier.background(if (dark) Color(0x991B2029) else Color(0xB8FFFFFF), shape).border(1.dp, if (dark) Color.White.copy(.10f) else Color.White.copy(.78f), shape)) { Column(Modifier.padding(18.dp), content = content) }
+}
+
+@Composable
+private fun IconBubble(icon: androidx.compose.ui.graphics.vector.ImageVector) { Surface(shape = CircleShape, color = MaterialTheme.colorScheme.primaryContainer.copy(.75f)) { Icon(icon, null, Modifier.padding(12.dp), tint = MaterialTheme.colorScheme.primary) } }
+
+@Composable
+private fun StatusPill(text: String, color: Color) { Surface(shape = RoundedCornerShape(50), color = color.copy(.11f)) { Text(text, Modifier.padding(horizontal = 11.dp, vertical = 7.dp), color = color, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold) } }
+
+@Composable
+private fun BuildMetaRow(label: String, value: String) { Row(Modifier.fillMaxWidth().padding(vertical = 3.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) { Text(label, Modifier.width(92.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall); Text(value, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis) } }
+
+@Composable
+private fun ErrorCard(message: String, onRetry: (() -> Unit)? = null) { GlassCard { Row(verticalAlignment = Alignment.Top) { Icon(Icons.Default.ErrorOutline, null, tint = MaterialTheme.colorScheme.error); Spacer(Modifier.width(10.dp)); Column(Modifier.weight(1f)) { Text("Something went wrong", fontWeight = FontWeight.SemiBold); Spacer(Modifier.height(3.dp)); Text(message, color = MaterialTheme.colorScheme.onSurfaceVariant); if (onRetry != null) { Spacer(Modifier.height(10.dp)); TextButton(onClick = onRetry) { Text("Try again") } } } } } }
+
+private fun downloadPercent(status: String): Int? = Regex("(\\d+)%").find(status)?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(0, 100)
+private fun formatBytes(size: Long?): String = when { size == null || size < 0 -> "Unknown"; size < 1024 -> "$size B"; size < 1024 * 1024 -> String.format(Locale.US, "%.1f KB", size / 1024.0); size < 1024L * 1024L * 1024L -> String.format(Locale.US, "%.1f MB", size / (1024.0 * 1024.0)); else -> String.format(Locale.US, "%.2f GB", size / (1024.0 * 1024.0 * 1024.0)) }
+private fun formatDate(timestamp: Long): String = SimpleDateFormat("dd MMM yyyy, HH:mm", Locale.US).format(Date(timestamp * 1000))
+private fun archiveVersion(filename: String): String? = Regex("lineage-([0-9.]+)-").find(filename)?.groupValues?.getOrNull(1)
