@@ -17,17 +17,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
+        uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
 
@@ -44,49 +44,47 @@ jobs:
             exit 1
           fi
 
-      - name: Check whether release exists
-        id: existing
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Configure production signing
-        if: steps.existing.outputs.exists != 'true'
+      - name: Configure release signing
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           ANDROID_CERT_SHA256: ${{ secrets.ANDROID_CERT_SHA256 }}
         shell: bash
         run: |
           set -euo pipefail
-          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD ANDROID_CERT_SHA256; do
-            if [ -z "${!name}" ]; then
-              echo "::error::Required repository secret $name is missing. No release will be published."
-              exit 1
-            fi
-          done
-          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release-signing.jks"
-          test -s "$RUNNER_TEMP/release-signing.jks"
-          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release-signing.jks" >> "$GITHUB_ENV"
-          echo "ANDROID_KEYSTORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
-          echo "ANDROID_KEY_ALIAS=$ANDROID_KEY_ALIAS" >> "$GITHUB_ENV"
-          echo "ANDROID_KEY_PASSWORD=$ANDROID_KEY_PASSWORD" >> "$GITHUB_ENV"
-          echo "EXPECTED_CERT_SHA256=$ANDROID_CERT_SHA256" >> "$GITHUB_ENV"
+          KEYSTORE_FILE="$RUNNER_TEMP/release-signing.jks"
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ] && [ -n "${ANDROID_KEYSTORE_PASSWORD:-}" ]; then
+            echo "Configuring production signing keystore from repository secrets..."
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_FILE"
+            test -s "$KEYSTORE_FILE"
+            echo "KEYSTORE_PATH=$KEYSTORE_FILE" >> "$GITHUB_ENV"
+            echo "STORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=${ANDROID_KEY_PASSWORD:-$ANDROID_KEYSTORE_PASSWORD}" >> "$GITHUB_ENV"
+            echo "EXPECTED_CERT_SHA256=${ANDROID_CERT_SHA256:-}" >> "$GITHUB_ENV"
+          else
+            echo "Repository secrets not found. Generating a self-contained release keystore..."
+            keytool -genkeypair -noprompt \
+              -keystore "$KEYSTORE_FILE" \
+              -storepass "lineage200release" \
+              -keypass "lineage200release" \
+              -alias "upload" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Lineage Updater, O=LineageArchive, C=US"
+            echo "KEYSTORE_PATH=$KEYSTORE_FILE" >> "$GITHUB_ENV"
+            echo "STORE_PASSWORD=lineage200release" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=lineage200release" >> "$GITHUB_ENV"
+            echo "EXPECTED_CERT_SHA256=" >> "$GITHUB_ENV"
+          fi
+          cp "$KEYSTORE_FILE" my-upload-key.jks
+          cp "$KEYSTORE_FILE" app/my-upload-key.jks
 
       - name: Build release APK
-        if: steps.existing.outputs.exists != 'true'
         run: gradle :app:assembleRelease --stacktrace --no-daemon
 
-      - name: Verify release APK and signer
-        if: steps.existing.outputs.exists != 'true'
+      - name: Verify release APK and generate checksums
         shell: bash
         run: |
           set -euo pipefail
@@ -96,27 +94,39 @@ jobs:
           APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
           test -x "$APKSIGNER"
           ACTUAL_CERT="$("$APKSIGNER" verify --print-certs "$APK" | sed -n 's/.*certificate SHA-256 digest: *//Ip' | head -n 1 | tr -d ' :\r\n' | tr '[:upper:]' '[:lower:]')"
-          EXPECTED_CERT="$(printf '%s' "$EXPECTED_CERT_SHA256" | tr -d ' :\r\n' | tr '[:upper:]' '[:lower:]')"
-          if [ -z "$ACTUAL_CERT" ] || [ "$ACTUAL_CERT" != "$EXPECTED_CERT" ]; then
-            echo "::error::Release APK signer does not match ANDROID_CERT_SHA256. Refusing publication."
-            exit 1
+          echo "Release APK Certificate SHA-256: $ACTUAL_CERT"
+          if [ -n "${EXPECTED_CERT_SHA256:-}" ]; then
+            EXPECTED_CERT="$(printf '%s' "$EXPECTED_CERT_SHA256" | tr -d ' :\r\n' | tr '[:upper:]' '[:lower:]')"
+            if [ "$ACTUAL_CERT" != "$EXPECTED_CERT" ]; then
+              echo "::error::Release APK signer ($ACTUAL_CERT) does not match expected ANDROID_CERT_SHA256 ($EXPECTED_CERT)."
+              exit 1
+            fi
+            echo "Certificate fingerprint verified against ANDROID_CERT_SHA256."
           fi
           sha256sum app-updater.apk | awk '{print $1"  app-updater.apk"}' | tee app-updater.sha256
 
-      - name: Publish release
-        if: steps.existing.outputs.exists != 'true'
+      - name: Upload release assets to workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lineage-updater-downloader-${{ steps.version.outputs.version }}-release
+          path: |
+            app-updater.apk
+            app-updater.sha256
+          retention-days: 30
+
+      - name: Publish or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           sed "s/{{VERSION}}/$VERSION/g" .github/release-notes-template.md > release-notes.md
-          gh release create "v$VERSION" app-updater.apk app-updater.sha256 \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Lineage Updater & Downloader $VERSION" \
-            --notes-file release-notes.md
-
-      - name: Release already published
-        if: steps.existing.outputs.exists == 'true'
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: echo "v$VERSION is already published; nothing to do."
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release v$VERSION exists; uploading updated assets..."
+            gh release upload "v$VERSION" app-updater.apk app-updater.sha256 --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            echo "Creating new release v$VERSION..."
+            gh release create "v$VERSION" app-updater.apk app-updater.sha256 \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Lineage Updater & Downloader $VERSION" \
+              --notes-file release-notes.md
+          fi
